@@ -23,10 +23,13 @@ namespace
 constexpr char kUsage[] =
   "Usage: sample DATASET [--mode quick|regular|dense] [--spacing METERS]\n"
   "       [--merge-radius METERS] [--min-cost 1] [--max-cost 200] [--goal-yaw RADIANS]\n"
+  "       [--inflation-cost-step N] (1..252, default 252; one goal per obstacle group per occupied cost band)\n"
   "       [--base-frame base_footprint] [--costmap-service /global_costmap/get_costmap]\n"
   "       [--timeout SECONDS] [--ros-args ...]\n"
-  "Regular uses 3 m tiles; quick caps these at 5 per free component; dense uses 1 m tiles.\n"
-  "Specify a new dataset directory. Goal yaw defaults to zero in the costmap frame.\n";
+  "Regular uses 0.5 m base tiles by default, merging fully free 2x2 and 4x4 tile blocks.\n"
+  "Quick uses 3 m tiles capped at 5 per free component; dense uses fixed 1 m tiles.\n"
+  "Writes DATASET (all goals) and DATASET_inflation (inflation goals only). Both paths must be new.\n"
+  "Goal yaw defaults to zero in the costmap frame.\n";
 
 struct Arguments
 {
@@ -54,7 +57,10 @@ Arguments parse(const std::vector<std::string> & args)
     throw std::invalid_argument(kUsage);
   }
   Arguments a;
-  a.directory = args[1];
+  a.directory = std::filesystem::path(args[1]).lexically_normal();
+  if (!a.directory.has_filename() && a.directory.has_relative_path()) {
+    a.directory = a.directory.parent_path();
+  }
   std::string mode = "regular";
   std::optional<double> spacing;
   for (size_t i = 2; i < args.size(); i += 2) {
@@ -73,6 +79,11 @@ Arguments parse(const std::vector<std::string> & args)
       a.options.min_cost = number<int>(val);
     } else if (key == "--max-cost") {
       a.options.max_cost = number<int>(val);
+    } else if (key == "--inflation-cost-step") {
+      a.options.inflation_cost_step = number<int>(val);
+      if (a.options.inflation_cost_step < 1 || a.options.inflation_cost_step > 252) {
+        throw std::invalid_argument("--inflation-cost-step must be in [1, 252]");
+      }
     } else if (key == "--goal-yaw") {
       a.options.goal_yaw = number<double>(val);
     } else if (key == "--base-frame") {
@@ -88,7 +99,10 @@ Arguments parse(const std::vector<std::string> & args)
   if (mode != "quick" && mode != "regular" && mode != "dense") {
     throw std::invalid_argument("--mode must be quick, regular or dense");
   }
-  a.options.spacing = spacing.value_or(mode == "dense" ? 1.0 : 3.0);
+  if (mode == "quick") {a.options.spacing = 3.0;}
+  if (mode == "dense") {a.options.spacing = 1.0;}
+  a.options.spacing = spacing.value_or(a.options.spacing);
+  a.options.adaptive_free_tiles = mode == "regular";
   a.options.max_free_per_component = mode == "quick" ? 5 : 0;
   if (a.options.spacing <= 0 || a.options.merge_radius < 0 || a.options.min_cost < 1 ||
     a.options.max_cost > 252 || a.options.max_cost < a.options.min_cost ||
@@ -101,8 +115,11 @@ Arguments parse(const std::vector<std::string> & args)
 
 void sample(const Arguments & a)
 {
-  if (std::filesystem::exists(a.directory)) {
-    throw std::runtime_error("Dataset already exists: " + a.directory.string());
+  const std::filesystem::path inflation_dir = a.directory.string() + "_inflation";
+  for (const auto & dir : {a.directory, inflation_dir}) {
+    if (std::filesystem::exists(dir)) {
+      throw std::runtime_error("Dataset already exists: " + dir.string());
+    }
   }
   auto node = std::make_shared<rclcpp::Node>("grid_plan_sample");
   tf2_ros::Buffer buffer(node->get_clock());
@@ -137,13 +154,17 @@ void sample(const Arguments & a)
   start.position.z = tf.transform.translation.z;
   start.orientation = tf.transform.rotation;
   const cv::Mat pixels(g.height, g.width, CV_8UC1, map.data.data());
-  const auto targets = gt::sampleTargets(pixels, g, a.options);
+  auto targets = gt::sampleTargets(pixels, g, a.options);
   gt::saveDataset(a.directory, map, start, tf.header.stamp, a.options, targets);
-  const auto free = std::count_if(targets.begin(), targets.end(),
-    [](const auto & t) {return t.kind == "free";});
+  const auto total = targets.size();
+  targets.erase(std::remove_if(targets.begin(), targets.end(),
+    [](const auto & t) {return t.kind != "inflation";}), targets.end());
+  gt::saveDataset(inflation_dir, map, start, tf.header.stamp, a.options, targets);
   std::cout << a.directory << ": " << g.width << "x" << g.height << ", frame=" << g.frame
-            << ", free=" << free << ", inflation=" << targets.size() - free
-            << ", total=" << targets.size() << '\n';
+            << ", free=" << total - targets.size() << ", inflation=" << targets.size()
+            << ", total=" << total << '\n'
+            << inflation_dir << ": inflation only, total=" << targets.size() << '\n'
+            << "ros2 run grid_plan_tester run " << inflation_dir << " navfn\n";
 }
 }  // namespace
 

@@ -29,9 +29,11 @@ struct Target
 
 struct SamplingOptions
 {
-  double spacing{3.0}, merge_radius{0.01};
+  double spacing{0.5}, merge_radius{0.01};
   int max_free_per_component{0}, min_cost{1}, max_cost{200};
   double goal_yaw{0.0};
+  bool adaptive_free_tiles{true};
+  int inflation_cost_step{252};
 };
 
 struct Dataset

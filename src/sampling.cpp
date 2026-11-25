@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <utility>
 
@@ -75,6 +76,28 @@ void limitFreeSamples(std::vector<cv::Point> & points, const Centroid & center, 
   points = std::move(chosen);
 }
 
+// Mark the base tiles that retain a representative. Only complete, all-zero squares merge.
+cv::Mat1b adaptiveFreeTiles(const cv::Mat & map, int tile)
+{
+  cv::Mat1b keep(1 + (map.rows - 1) / tile, 1 + (map.cols - 1) / tile, uchar{1});
+  for (const int factor : {2, 4}) {
+    if (tile > std::min(map.rows, map.cols) / factor) {continue;}
+    const int side = tile * factor;
+    // Even-sized base tiles pick the lower of their two center cells. Keep the
+    // base representative nearest the merged center, breaking ties toward the origin.
+    const int middle = factor / 2 - tile % 2;
+    for (int y = 0; y <= map.rows - side; y += side) {
+      for (int x = 0; x <= map.cols - side; x += side) {
+        if (cv::countNonZero(map(cv::Rect(x, y, side, side))) != 0) {continue;}
+        const int row = y / tile, col = x / tile;
+        keep(cv::Rect(col, row, factor, factor)).setTo(0);
+        keep(row + middle, col + middle) = 1;
+      }
+    }
+  }
+  return keep;
+}
+
 void appendFreeTargets(
   const cv::Mat & map, const MapGeometry & geometry, const SamplingOptions & options,
   std::vector<Target> & out)
@@ -91,6 +114,7 @@ void appendFreeTargets(
   const double max_side = std::max(map.cols, map.rows);
   const int tile = std::max(
     1, static_cast<int>(std::round(std::min(options.spacing / geometry.resolution, max_side))));
+  const auto keep = options.adaptive_free_tiles ? adaptiveFreeTiles(map, tile) : cv::Mat1b{};
   for (int top = 0; top < map.rows; ) {
     const int bottom = top + std::min(tile, map.rows - top);
     for (int left = 0; left < map.cols; ) {
@@ -115,7 +139,7 @@ void appendFreeTargets(
           }
         }
       }
-      if (best_group != 0) {
+      if (best_group != 0 && (keep.empty() || keep(top / tile, left / tile))) {
         components[best_group].points.push_back(best);
       }
       left = right;
@@ -240,14 +264,17 @@ void appendInflationTargets(
   cv::Mat1i labels;
   const int count = cv::connectedComponents(dilated, labels, 8, CV_32S, cv::CCL_SAUF);
   dilated.release();
-  struct Group
+  struct Band
   {
     Centroid center;
     std::vector<uchar> costs;
     int twice_median{}, best_error{std::numeric_limits<int>::max()};
     cv::Point best{-1, -1};
   };
-  std::vector<Group> groups(count);
+  std::vector<std::map<int, Band>> groups(count);
+  const auto bandIndex = [&](int cost) {
+      return (cost - options.min_cost) / options.inflation_cost_step;
+    };
   for (int y = 0; y < map.rows; ++y) {
     const auto * costs = map.ptr<uchar>(y);
     auto * row = owners.ptr<int>(y);
@@ -256,7 +283,7 @@ void appendInflationTargets(
       if (cost >= options.min_cost && cost <= options.max_cost) {
         const int source = row[x];
         row[x] = labels(source / map.cols, source % map.cols);
-        auto & g = groups[row[x]];
+        auto & g = groups[row[x]][bandIndex(cost)];
         g.center.add(x, y);
         g.costs.push_back(costs[x]);
       } else {
@@ -265,8 +292,9 @@ void appendInflationTargets(
     }
   }
   labels.release();
-  for (auto & g : groups) {
-    if (!g.costs.empty()) {
+  for (auto & group : groups) {
+    for (auto & entry : group) {
+      auto & g = entry.second;
       auto mid = g.costs.begin() + g.costs.size() / 2;
       std::nth_element(g.costs.begin(), mid, g.costs.end());
       const int lower = g.costs.size() % 2 ? *mid : *std::max_element(g.costs.begin(), mid);
@@ -280,7 +308,7 @@ void appendInflationTargets(
       if (row[x] == 0) {
         continue;
       }
-      auto & g = groups[row[x]];
+      auto & g = groups[row[x]].at(bandIndex(costs[x]));
       const int error = std::abs(2 * costs[x] - g.twice_median);
       const cv::Point p(x, y);
       if (error < g.best_error ||
@@ -292,8 +320,8 @@ void appendInflationTargets(
     }
   }
   for (int group = 1; group < count; ++group) {
-    const auto p = groups[group].best;
-    if (p.x >= 0) {
+    for (const auto & entry : groups[group]) {
+      const auto p = entry.second.best;
       out.push_back(makeTarget("inflation", group, p, map.at<uchar>(p), geometry, options.goal_yaw));
     }
   }
@@ -315,7 +343,9 @@ std::vector<Target> sampleTargets(
   if (!std::isfinite(options.spacing) || options.spacing <= 0.0 ||
     !std::isfinite(options.merge_radius) || options.merge_radius < 0.0 ||
     options.max_free_per_component < 0 || options.min_cost < 1 ||
-    options.max_cost > 252 || options.min_cost > options.max_cost || !std::isfinite(options.goal_yaw))
+    options.max_cost > 252 || options.min_cost > options.max_cost ||
+    options.inflation_cost_step < 1 || options.inflation_cost_step > 252 ||
+    !std::isfinite(options.goal_yaw))
   {
     throw std::invalid_argument("Invalid sampling spacing, merge radius, cap, cost range or yaw");
   }

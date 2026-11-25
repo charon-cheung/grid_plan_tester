@@ -100,6 +100,35 @@ TEST(Sampling, QuickCapSpansEachFreeRegionAndPreservesTargetIds)
   }
 }
 
+TEST(Sampling, MergesOnlyCompleteZeroCostSquaresAtTwoScales)
+{
+  // One complete open square, a second with a single non-free cell, and a clipped column.
+  for (const int cost : {1, 253, 254, 255}) {
+    cv::Mat map(4, 9, CV_8U, cv::Scalar(0));
+    map.at<uchar>(0, 4) = static_cast<uchar>(cost);
+    SamplingOptions options;
+    options.spacing = 0.5;
+    const auto targets = sampleTargets(map, geometry(map, 0.5), options);
+    int open = 0, mixed = 0, clipped = 0;
+    for (const auto & target : targets) {
+      ASSERT_EQ(target.kind, "free");
+      EXPECT_EQ(map.at<uchar>(target.my, target.mx), 0);
+      if (target.mx < 4) {
+        ++open;
+      } else if (target.mx < 8) {
+        ++mixed;
+      } else {
+        ++clipped;
+      }
+    }
+    EXPECT_EQ(open, 1);
+    EXPECT_EQ(mixed, 6);  // Three merged 2x2 squares plus three individual free cells.
+    EXPECT_EQ(clipped, 4);
+    options.adaptive_free_tiles = false;
+    EXPECT_EQ(sampleTargets(map, geometry(map, 0.5), options).size(), 35u);
+  }
+}
+
 TEST(Sampling, InflationResolvesMedianCostThenCentroidThenRowColumn)
 {
   const cv::Mat map = (cv::Mat_<uchar>(1, 11) <<
@@ -135,6 +164,33 @@ TEST(Sampling, AssociatesInflationWithTheExactEuclideanNearestLethalCell)
   EXPECT_EQ(targets[0].my, 0);
   EXPECT_EQ(targets[1].mx, 18);
   EXPECT_EQ(targets[1].my, 8);
+}
+
+TEST(Sampling, RepresentsEveryOccupiedCostBandOfEachObstacle)
+{
+  const cv::Mat map = (cv::Mat_<uchar>(1, 13) <<
+    4, 254, 5, 44, 45, 84, 255, 205, 241, 254, 240, 5, 0);
+  SamplingOptions options;
+  options.min_cost = 5;
+  options.max_cost = 240;
+  options.merge_radius = 0.0;
+  options.inflation_cost_step = 40;
+  const auto targets = sampleTargets(map, geometry(map), options);
+  std::map<int, std::multiset<int>> bands;
+  int free = 0;
+  for (const auto & t : targets) {
+    if (t.kind == "free") {
+      ++free;
+      continue;
+    }
+    ASSERT_GE(t.cost, 5);
+    ASSERT_LE(t.cost, 240);
+    bands[t.group].insert((t.cost - 5) / 40);
+  }
+  EXPECT_EQ(free, 1);
+  ASSERT_EQ(bands.size(), 2u);
+  EXPECT_EQ(bands.at(1), (std::multiset<int>{0, 1}));
+  EXPECT_EQ(bands.at(2), (std::multiset<int>{0, 5}));
 }
 
 TEST(Sampling, GroupsLethalFragmentsByEuclideanDilationInMeters)

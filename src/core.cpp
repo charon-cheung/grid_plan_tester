@@ -265,10 +265,12 @@ void saveDataset(
   pose["qw"] = start.orientation.w;
   auto sampling = meta["sampling"];
   sampling["spacing"] = options.spacing;
+  sampling["adaptive_free_tiles"] = options.adaptive_free_tiles;
   sampling["max_free_per_component"] = options.max_free_per_component;
   sampling["merge_radius"] = options.merge_radius;
   sampling["min_cost"] = options.min_cost;
   sampling["max_cost"] = options.max_cost;
+  sampling["inflation_cost_step"] = options.inflation_cost_step;
   sampling["goal_yaw"] = options.goal_yaw;
 
   const fs::path dest = fs::absolute(destination).lexically_normal();
