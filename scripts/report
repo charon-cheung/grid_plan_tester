@@ -1,0 +1,394 @@
+#!/usr/bin/env python3
+"""Summarize a fixed grid goal dataset and render its requested goals."""
+
+import argparse
+from collections import Counter, defaultdict
+import csv
+from io import StringIO
+import math
+from pathlib import Path
+import sys
+from tempfile import TemporaryDirectory
+from typing import NamedTuple
+
+from PIL import Image, ImageDraw, ImageFont
+import yaml
+
+
+COLORS = {
+    'hit': (0, 142, 102), 'adjusted': (228, 152, 0), 'failed': (208, 58, 45),
+    'planner_timeout': (185, 31, 128), 'incomplete': (121, 78, 182), 'pending': (104, 126, 147),
+}
+START_COLOR = (0, 88, 192)
+RANK = {'failed': 0, 'adjusted': 1, 'hit': 2}
+ATTEMPT_STATUSES = ('hit', 'adjusted', 'failed', 'incomplete')
+STATUSES = (*ATTEMPT_STATUSES, 'pending')
+RESULT_FIELDS = (
+    'id,status,action_status,error_code,error_msg,wall_ms,planning_ms,poses,'
+    'length_m,end_x,end_y,end_error_m'
+).split(',')
+
+
+class Target(NamedTuple):
+    kind: str
+    mx: int
+    my: int
+    x: float
+    y: float
+
+
+class Outcome(NamedTuple):
+    status: str
+    error_code: int | None
+
+    @property
+    def marker_status(self):
+        if self.status == 'failed' and self.error_code == 207:
+            return 'planner_timeout'
+        return self.status
+
+
+PENDING = Outcome('pending', None)
+
+
+def metadata(path):
+    with path.open(encoding='utf-8') as stream:
+        # Keep opaque IDs with leading zeroes or YAML-special spellings intact.
+        data = yaml.load(stream, Loader=yaml.BaseLoader)
+    if not isinstance(data, dict) or not data.get('dataset_id'):
+        raise ValueError(f'{path} is missing dataset_id')
+    return data
+
+
+def fingerprint(preamble, payload):
+    """FNV-1a 64 over the same bytes as core.cpp's mapId and datasetId."""
+    value = 0xcbf29ce484222325
+    for block in (preamble.encode('utf-8'), payload):
+        for byte in block:
+            value = ((value ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+    return f'{value:016x}'
+
+
+def read_dataset(directory):
+    manifest = metadata(directory / 'manifest.yaml')
+    if manifest.get('schema_version') != '1':
+        raise ValueError('unsupported manifest schema_version (expected 1)')
+    for key in ('width', 'height'):
+        manifest[key] = int(manifest[key])
+    geometry_fields = ('resolution', 'origin_x', 'origin_y', 'origin_yaw')
+    pose_fields = ('x', 'y', 'z', 'qx', 'qy', 'qz', 'qw')
+    for key in geometry_fields:
+        manifest[key] = float(manifest[key])
+    start = manifest['start']
+    for key in pose_fields:
+        start[key] = float(start[key])
+    width, height = manifest['width'], manifest['height']
+    if (not manifest['frame'] or min(width, height, manifest['resolution']) <= 0
+            or not all(math.isfinite(manifest[k]) for k in geometry_fields)
+            or not all(math.isfinite(start[k]) for k in pose_fields)):
+        raise ValueError('invalid frame, map geometry, or start pose in manifest.yaml')
+
+    with Image.open(directory / 'costmap.png') as image:
+        if image.mode != 'L' or image.size != (width, height):
+            raise ValueError('costmap.png must match manifest dimensions and contain 8-bit costs')
+        costs = image.copy()
+    geometry = ' '.join(format(manifest[k], '.17g') for k in geometry_fields)
+    preamble = f'{manifest["frame"]}\n{width} {height} {geometry}\n'
+    if fingerprint(preamble, costs.tobytes()) != manifest['map_id']:
+        raise ValueError('map_id mismatch: snapshot pixels or geometry changed since sampling')
+    raw_targets = (directory / 'targets.csv').read_bytes()
+    pose = ' '.join(format(start[k], '.17g') for k in pose_fields)
+    if fingerprint(f'{manifest["map_id"]}\n{pose}\n', raw_targets) != manifest['dataset_id']:
+        raise ValueError('dataset_id mismatch: frozen start or targets.csv changed since sampling')
+
+    targets = {}
+    with StringIO(raw_targets.decode('utf-8'), newline='') as stream:
+        reader = csv.DictReader(stream, strict=True)
+        if not set('id kind group mx my cost x y yaw'.split()) <= set(reader.fieldnames or []):
+            raise ValueError('invalid targets.csv header')
+        for row in reader:
+            key = row['id']
+            target = Target(row['kind'], int(row['mx']), int(row['my']),
+                            float(row['x']), float(row['y']))
+            if (not key or key in targets or target.kind not in ('free', 'inflation')
+                    or not 0 <= target.mx < manifest['width']
+                    or not 0 <= target.my < manifest['height']
+                    or not (math.isfinite(target.x) and math.isfinite(target.y))):
+                raise ValueError(f'invalid or duplicate target at targets.csv:{reader.line_num}')
+            targets[key] = target
+    return manifest, targets, costs
+
+
+def read_run(directory, name, manifest, targets):
+    if not name or name in ('.', '..') or Path(name).name != name:
+        raise ValueError(f'invalid run name {name!r}')
+    run_dir = directory / 'runs' / name
+    info = metadata(run_dir / 'run.yaml')
+    info.setdefault('map_id', manifest['map_id'])
+    for key in ('dataset_id', 'map_id'):
+        if info[key] != manifest[key]:
+            raise ValueError(f'run {name!r} {key} {info[key]!r} differs from {manifest[key]!r}')
+    path = run_dir / 'results.csv'
+    latest = {}
+    if path.exists():
+        skipped = Counter()
+        with path.open('rb') as stream:
+            for number, raw in enumerate(stream, 1):
+                # The runner removes embedded newlines and commits each record with LF.
+                if not raw.endswith(b'\n'):
+                    skipped['uncommitted tail'] += 1
+                    break
+                try:
+                    row = next(csv.reader([raw.decode('utf-8')], strict=True))
+                except (UnicodeError, csv.Error):
+                    if number == 1:
+                        raise ValueError(f'invalid header in {path}') from None
+                    skipped['malformed'] += 1
+                    continue
+                if number == 1:
+                    if row != RESULT_FIELDS:
+                        raise ValueError(f'invalid header in {path}')
+                    continue
+                if len(row) != len(RESULT_FIELDS) or row[1] not in ATTEMPT_STATUSES:
+                    skipped['malformed'] += 1
+                    continue
+                if row[0] not in targets:
+                    skipped['unknown target ID'] += 1
+                    continue
+                try:
+                    code = int(row[3]) if row[3] else None
+                except ValueError:
+                    skipped['malformed'] += 1
+                    continue
+                latest[row[0]] = Outcome(row[1], code)
+        if skipped:
+            detail = ', '.join(f'{reason}={count}' for reason, count in skipped.items())
+            print(f'{path}: ignored records ({detail})', file=sys.stderr)
+    return info, latest
+
+
+def fraction(value, total):
+    percent = f'{100 * value / total:.1f}%' if total else 'n/a'
+    return f'{value}/{total} ({percent})'
+
+
+def summarize(name, info, targets, results):
+    print(f'\nRun {name}   planner_id={info["planner_id"]}')
+    if 'live_costmap_observations' in info:
+        observations = info['live_costmap_observations']
+        if (not isinstance(observations, list)
+                or any(not isinstance(o, dict) for o in observations)):
+            raise ValueError('invalid live_costmap_observations in run.yaml')
+        snapshots = [o.get(k) for o in observations for k in ('start_map_id', 'end_map_id')]
+        captured = [v for v in snapshots
+                    if isinstance(v, str) and v.lower() not in ('', '~', 'null')]
+        matching = captured.count(info['map_id'])
+        print('Live costmap start/end snapshots vs sampling map   '
+              f'matching={matching} different={len(captured) - matching} '
+              f'missing={len(snapshots) - len(captured)} (sessions={len(observations)})')
+    groups = {key: Counter() for key in ('all', 'free', 'inflation')}
+    for key, target in targets.items():
+        outcome = results.get(key, PENDING)
+        for counts in (groups['all'], groups[target.kind]):
+            counts[outcome.status] += 1
+            if outcome.marker_status == 'planner_timeout':
+                counts['planner_timeout'] += 1
+    for kind, counts in groups.items():
+        total = sum(counts[s] for s in STATUSES)
+        completed = sum(counts[s] for s in RANK)
+        hit = counts['hit']
+        path = hit + counts['adjusted']
+        statuses = ' '.join(f'{s}={counts[s]}' for s in STATUSES)
+        print(f'{kind:<10} total={total} {statuses} planner_timeouts={counts["planner_timeout"]}')
+        print(f'           completed/total={fraction(completed, total)}'
+              f'  hit/total={fraction(hit, total)}')
+        print(f'           hit/completed={fraction(hit, completed)}'
+              f'  path/completed={fraction(path, completed)}')
+    return groups['all']
+
+
+def compare(base_name, name, targets, base, current):
+    regressions, improvements = defaultdict(list), defaultdict(list)
+    paired = 0
+    for key in targets:
+        before, after = base.get(key, PENDING).status, current.get(key, PENDING).status
+        if before not in RANK or after not in RANK:
+            continue
+        paired += 1
+        if RANK[after] < RANK[before]:
+            regressions[before, after].append(key)
+        elif RANK[after] > RANK[before]:
+            improvements[before, after].append(key)
+    print(f'\nComparison {base_name} -> {name}   comparable={paired}/{len(targets)}'
+          f'   incomplete or pending in either run={len(targets) - paired}')
+    print('Both runs use the recorded start and goals. Each request uses the live costmap.')
+    for label, changes in (('regressions', regressions), ('improvements', improvements)):
+        print(f'{label}={sum(map(len, changes.values()))}')
+        for (before, after), ids in changes.items():
+            print(f'  {before} -> {after} ({len(ids)})  {", ".join(ids)}')
+
+
+def draw_goal(draw, bounds, status):
+    left, top, right, bottom = bounds
+    color = COLORS[status]
+    stroke = max(1, round((right - left) / 5))
+    if left == right:
+        draw.point((left, top), fill=color)
+    elif status == 'hit':
+        draw.ellipse(bounds, outline=color, width=stroke)
+    elif status == 'failed':
+        draw.line((left, top, right, bottom), fill=color, width=stroke)
+        draw.line((right, top, left, bottom), fill=color, width=stroke)
+    else:
+        draw.rectangle(bounds, fill=color)
+
+
+def save_coverage(path, manifest, costs, targets, results, counts):
+    name = path.parent.name
+    width, height = manifest['width'], manifest['height']
+    scale = max(1, min(12, 1200 // max(width, height)))
+    # Free, inflation, inscribed, lethal, then unknown.
+    grays = [246] + [230 - c * 145 // 252 for c in range(1, 253)] + [62, 27]
+    costs.putpalette([v for gray in grays for v in (gray,) * 3] + [164, 178, 189])
+    layer = costs.transpose(Image.Transpose.FLIP_TOP_BOTTOM).convert('RGB')
+    if scale != 1:
+        layer = layer.resize((width * scale, height * scale), Image.Resampling.NEAREST)
+    draw = ImageDraw.Draw(layer)
+    ui_scale = max(1., max(layer.size) / 1000)
+
+    def px(value):
+        return round(value * ui_scale)
+
+    # Keep adjacent target cells distinguishable, enlarge sparse sites for visibility.
+    radius = min(px(4), int(scale * math.sqrt(width * height / max(1, len(targets))) / 4))
+    for key, target in targets.items():
+        x = int((target.mx + 0.5) * scale)
+        y = int((height - target.my - 0.5) * scale)
+        draw_goal(draw, (x - radius, y - radius, x + radius, y + radius),
+                  results.get(key, PENDING).marker_status)
+
+    start = manifest['start']
+    dx, dy = start['x'] - manifest['origin_x'], start['y'] - manifest['origin_y']
+    yaw, resolution = manifest['origin_yaw'], manifest['resolution']
+    sx = (math.cos(yaw) * dx + math.sin(yaw) * dy) / resolution
+    sy = (-math.sin(yaw) * dx + math.cos(yaw) * dy) / resolution
+    if 0 <= sx < width and 0 <= sy < height:
+        start_label = 'Start'
+        x = int(sx * scale)
+        y = min(layer.height - 1, int((height - sy) * scale))
+        arm = max(px(7), min(12, scale + 2))
+        draw.line((x - arm, y, x + arm, y), fill=START_COLOR, width=px(3))
+        draw.line((x, y - arm, x, y + arm), fill=START_COLOR, width=px(3))
+    else:
+        start_label = f'Start outside map ({start["x"]:.2f}, {start["y"]:.2f})'
+
+    font = ImageFont.load_default(size=px(16))
+    labels = {s: f'{s.replace("_", " ")}   {counts[s]}' for s in COLORS}
+    labels['failed'] = f'failed (other)   {counts["failed"] - counts["planner_timeout"]}'
+    labels['planner_timeout'] = f'planner timeout (207)   {counts["planner_timeout"]}'
+    frame = f'Frame  {manifest["frame"]}'
+    panel = math.ceil(max(font.getlength(t) for t in [name, frame, 'Requested goals', start_label,
+                                                      *labels.values()])) + px(48)
+    canvas = Image.new('RGB', (layer.width + panel, max(layer.height, px(285))), 'white')
+    canvas.paste(layer)
+    draw = ImageDraw.Draw(canvas)
+    left = layer.width + px(14)
+    draw.text((left, px(8)), name, fill='black', font=font)
+    draw.text((left, px(32)), frame, fill='#344250', font=font)
+    draw.text((left, px(70)), 'Requested goals', fill='black', font=font)
+    for i, (status, label) in enumerate(labels.items()):
+        y = px(102 + 23 * i)
+        draw_goal(draw, (left, y, left + px(9), y + px(9)), status)
+        draw.text((left + px(18), y - px(4)), label, fill='black', font=font)
+    draw.line((left, px(254), left + px(12), px(254)), fill=START_COLOR, width=px(3))
+    draw.line((left + px(6), px(248), left + px(6), px(260)), fill=START_COLOR, width=px(3))
+    draw.text((left + px(18), px(244)), start_label, fill='black', font=font)
+    with TemporaryDirectory(dir=path.parent) as temp:
+        out = Path(temp) / path.name
+        canvas.save(out)
+        out.replace(path)
+
+
+def publish_rviz(manifest, targets, results):
+    import rclpy
+    from geometry_msgs.msg import Point
+    from rclpy.executors import ExternalShutdownException
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+    from visualization_msgs.msg import Marker, MarkerArray
+
+    def marker(index, shape, color):
+        msg = Marker()
+        msg.header.frame_id = manifest['frame']
+        msg.ns, msg.id, msg.type = 'grid_plan_tester', index, shape
+        msg.pose.orientation.w = 1.0
+        msg.color.r, msg.color.g, msg.color.b = (channel / 255. for channel in color)
+        msg.color.a = 1.0
+        return msg
+
+    resolution = manifest['resolution']
+    sites = {s: marker(i, Marker.POINTS, color) for i, (s, color) in enumerate(COLORS.items())}
+    for key, target in targets.items():
+        site = sites[results.get(key, PENDING).marker_status]
+        site.points.append(Point(x=target.x, y=target.y, z=0.03))
+    for msg in sites.values():
+        msg.scale.x = msg.scale.y = max(0.08, resolution)
+        if not msg.points:
+            msg.action = Marker.DELETE
+    start = marker(len(sites), Marker.ARROW, START_COLOR)
+    p = manifest['start']
+    start.pose.position = Point(x=p['x'], y=p['y'], z=p['z'] + 0.04)
+    q = start.pose.orientation
+    q.x, q.y, q.z, q.w = (p[k] for k in ('qx', 'qy', 'qz', 'qw'))
+    start.scale.x = max(0.32, 4 * resolution)
+    start.scale.y = start.scale.z = max(0.1, resolution)
+    rclpy.init(args=[])
+    node = rclpy.create_node('grid_plan_tester_report')
+    try:
+        qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+        topic = '/grid_plan_tester/results'
+        publisher = node.create_publisher(MarkerArray, topic, qos)
+        message = MarkerArray(markers=[*sites.values(), start])
+        publisher.publish(message)
+        # Volatile RViz subscribers can join after the first publication.
+        node.create_timer(1., lambda: publisher.publish(message))
+        print(f'RViz MarkerArray on {topic} (Transient Local). Press Ctrl+C to exit.', flush=True)
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.try_shutdown()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('dataset', type=Path)
+    parser.add_argument('run_name')
+    parser.add_argument('--compare', metavar='BASELINE', help='compare baseline to run_name by ID')
+    parser.add_argument('--rviz', action='store_true', help='publish goal markers until Ctrl+C')
+    args = parser.parse_args()
+    try:
+        manifest, targets, costs = read_dataset(args.dataset)
+        info, current = read_run(args.dataset, args.run_name, manifest, targets)
+        if args.compare:
+            base_info, base = read_run(args.dataset, args.compare, manifest, targets)
+        print(f'Dataset {args.dataset}   dataset_id={manifest["dataset_id"]}')
+        print('completed = hit + adjusted + failed    path = hit + adjusted')
+        if args.compare:
+            summarize(args.compare, base_info, targets, base)
+        counts = summarize(args.run_name, info, targets, current)
+        if args.compare:
+            compare(args.compare, args.run_name, targets, base, current)
+        output = args.dataset / 'runs' / args.run_name / 'coverage.png'
+        save_coverage(output, manifest, costs, targets, current, counts)
+        print(f'\nCoverage PNG  {output}')
+        if args.rviz:
+            publish_rviz(manifest, targets, current)
+    except (ImportError, OSError, ValueError, TypeError, KeyError, yaml.YAMLError,
+            csv.Error) as exc:
+        parser.exit(2, f'report: {exc}\n')
+
+
+if __name__ == '__main__':
+    main()
