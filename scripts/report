@@ -259,13 +259,21 @@ def save_coverage(path, manifest, costs, targets, results, counts):
     def px(value):
         return round(value * ui_scale)
 
+    labels = {
+        'hit': f'succeed   {counts["hit"]}',
+        'adjusted': f'adjusted   {counts["adjusted"]}',
+        'failed': f'failed (other)   {counts["failed"] - counts["planner_timeout"]}',
+        'planner_timeout': f'planner timeout (207)   {counts["planner_timeout"]}',
+    }
     # Keep adjacent target cells distinguishable, enlarge sparse sites for visibility.
     radius = min(px(4), int(scale * math.sqrt(width * height / max(1, len(targets))) / 4))
     for key, target in targets.items():
+        status = results.get(key, PENDING).marker_status
+        if status not in labels:
+            continue
         x = int((target.mx + 0.5) * scale)
         y = int((height - target.my - 0.5) * scale)
-        draw_goal(draw, (x - radius, y - radius, x + radius, y + radius),
-                  results.get(key, PENDING).marker_status)
+        draw_goal(draw, (x - radius, y - radius, x + radius, y + radius), status)
 
     start = manifest['start']
     dx, dy = start['x'] - manifest['origin_x'], start['y'] - manifest['origin_y']
@@ -283,13 +291,10 @@ def save_coverage(path, manifest, costs, targets, results, counts):
         start_label = f'Start outside map ({start["x"]:.2f}, {start["y"]:.2f})'
 
     font = ImageFont.load_default(size=px(16))
-    labels = {s: f'{s.replace("_", " ")}   {counts[s]}' for s in COLORS}
-    labels['failed'] = f'failed (other)   {counts["failed"] - counts["planner_timeout"]}'
-    labels['planner_timeout'] = f'planner timeout (207)   {counts["planner_timeout"]}'
     frame = f'Frame  {manifest["frame"]}'
     panel = math.ceil(max(font.getlength(t) for t in [name, frame, 'Requested goals', start_label,
                                                       *labels.values()])) + px(48)
-    canvas = Image.new('RGB', (layer.width + panel, max(layer.height, px(285))), 'white')
+    canvas = Image.new('RGB', (layer.width + panel, max(layer.height, px(239))), 'white')
     canvas.paste(layer)
     draw = ImageDraw.Draw(canvas)
     left = layer.width + px(14)
@@ -300,9 +305,9 @@ def save_coverage(path, manifest, costs, targets, results, counts):
         y = px(102 + 23 * i)
         draw_goal(draw, (left, y, left + px(9), y + px(9)), status)
         draw.text((left + px(18), y - px(4)), label, fill='black', font=font)
-    draw.line((left, px(254), left + px(12), px(254)), fill=START_COLOR, width=px(3))
-    draw.line((left + px(6), px(248), left + px(6), px(260)), fill=START_COLOR, width=px(3))
-    draw.text((left + px(18), px(244)), start_label, fill='black', font=font)
+    draw.line((left, px(208), left + px(12), px(208)), fill=START_COLOR, width=px(3))
+    draw.line((left + px(6), px(202), left + px(6), px(214)), fill=START_COLOR, width=px(3))
+    draw.text((left + px(18), px(198)), start_label, fill='black', font=font)
     with TemporaryDirectory(dir=path.parent) as temp:
         out = Path(temp) / path.name
         canvas.save(out)

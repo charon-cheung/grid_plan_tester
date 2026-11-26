@@ -114,7 +114,9 @@ def test_latest_committed_attempts_and_rates(dataset):
         assert cell(30, 35, 3, 0) == cell(10, 12)  # Space between the cross arms.
         assert max(cell(10, 12)) - min(cell(10, 12)) < 10  # Mirror is empty.
         assert max(cell(16, 8)) - min(cell(16, 8)) > 65  # Rotated start pose.
-        assert len({cell(30, 35), cell(40, 8), cell(50, 8)}) == 3  # Failure / 207 / incomplete.
+        assert cell(30, 35) != cell(40, 8)  # Failure and timeout remain distinct.
+        for mx in (50, 60):  # Incomplete and pending show only the grayscale costmap.
+            assert len(set(cell(mx, 8))) == 1
 
 
 def test_comparison_uses_paired_finished_cases_and_rejects_other_dataset(dataset):
